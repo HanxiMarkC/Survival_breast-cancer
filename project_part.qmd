@@ -1,0 +1,319 @@
+---
+title: "Project part"
+author: "Hanxi Chen"
+subtitle: :)
+date: today
+format:
+  pdf:
+    documentclass: article
+    number-sections: false
+    fig-align: center
+    keep-tex: false  # keeps the intermediate .tex file
+  html:
+    theme: cosmo
+    embed-resources: true
+    number-sections: true
+    toc: true
+    toc-depth: 4
+    toc-location: left
+    code-fold: false
+    html-math-method: mathjax
+engine: knitr
+knitr:
+  opts_chunk: 
+    fig.align: 'center'
+    # fig.width: 6
+    # fig.height: 4
+    message: FALSE
+    cache: false
+editor: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE)
+```
+
+```{r, warning=FALSE}
+library(tidyverse)
+library(car)
+library(dplyr)
+library(survival)
+library(survminer)
+library(zoo) # na.locf
+
+library(janitor)
+library(skimr)
+
+library(tableone)
+
+library(tableone)
+library(gtsummary)
+```
+
+
+## Import and Cleaning
+
+```{r}
+METABRIC_RNA_Mutation <- read.csv("METABRIC_RNA_Mutation.csv")
+```
+
+```{r}
+dat0 <- METABRIC_RNA_Mutation %>%
+  as_tibble()
+
+# rename
+dat1 <- dat0 %>%
+  transmute(
+    patient_id,
+    er_status,
+    hormone_therapy,
+    chemotherapy,
+    os_months = overall_survival_months,
+    os_event = overall_survival,
+    
+    age = age_at_diagnosis,
+    tumor_size,
+    nodes_positive = lymph_nodes_examined_positive,
+    grade = neoplasm_histologic_grade,
+    her2 = her2_status,
+    pam50 = `pam50_._claudin.low_subtype`,
+    tumor_stage,
+    menopausal_state = inferred_menopausal_state,
+    pr_status,
+    surgery = type_of_breast_surgery,
+    radio_therapy
+  )
+
+# cleaning
+dat2 <- dat1 %>%
+  mutate(
+    across(where(is.character), ~na_if(.x, "")),
+    across(c(er_status, hormone_therapy, chemotherapy,
+             grade, her2, pam50, tumor_stage,
+             menopausal_state, pr_status, surgery, radio_therapy), as.character),
+    across(c(age, tumor_size, nodes_positive, os_months, os_event), as.numeric)
+  )
+```
+
+```{r}
+table(dat2$er_status, useNA = "ifany")
+table(dat2$hormone_therapy, useNA = "ifany")
+table(dat2$chemotherapy, useNA = "ifany")
+table(dat2$grade, useNA = "ifany")
+table(dat2$her2, useNA = "ifany")
+table(dat2$pam50, useNA = "ifany")
+table(dat2$tumor_stage, useNA = "ifany")
+table(dat2$menopausal_state, useNA = "ifany")
+table(dat2$pr_status, useNA = "ifany")
+table(dat2$surgery, useNA = "ifany")
+table(dat2$radio_therapy, useNA = "ifany")
+```
+```{r}
+dat_table1 <- dat2 %>%
+  filter(
+    er_status == "Positive",
+    hormone_therapy == 1
+  ) %>%
+  mutate(
+    chemo = chemotherapy,
+    trt_group = factor(
+      chemo,
+      levels = c(0, 1),
+      labels = c("Hormone only", "Hormone + Chemo")
+    )
+  ) %>%
+  filter(
+    !is.na(chemo),
+    !is.na(os_months),
+    !is.na(os_event)
+  )
+
+nrow(dat0)
+nrow(dat_table1)
+
+table(dat_table1$trt_group, useNA = "ifany")
+prop.table(table(dat_table1$trt_group))
+```
+```{r}
+vars_check <- c(
+  "age", "tumor_size", "nodes_positive",
+  "grade", "her2", "pam50", "tumor_stage",
+  "menopausal_state", "pr_status",
+  "surgery", "radio_therapy"
+)
+
+missing_by_group_long <- dat_table1 %>%
+  group_by(trt_group) %>%
+  summarise(
+    across(all_of(vars_check), ~mean(is.na(.))*100)
+  ) %>%
+  pivot_longer(
+    -trt_group,
+    names_to = "variable",
+    values_to = "pct_missing"
+  )
+
+missing_by_group_long
+```
+
+## Table 1: covariate distributions over Trt Groups
+
+```{r}
+# 废案
+vars <- c(
+  "age", "tumor_size", "nodes_positive",
+  "grade", "her2", "pam50", "tumor_stage",
+  "menopausal_state", "pr_status", "surgery", "radio_therapy"
+)
+
+factorVars <- c(
+  "grade", "her2", "pam50", "tumor_stage",
+  "menopausal_state", "pr_status", "surgery", "radio_therapy"
+)
+
+tab1 <- CreateTableOne(
+  vars = vars,
+  strata = "trt_group",
+  data = dat_table1,
+  factorVars = factorVars,
+  includeNA = TRUE
+)
+
+print(
+  tab1,
+  showAllLevels = TRUE,
+  quote = FALSE,
+  noSpaces = TRUE,
+  nonnormal = c("tumor_size", "nodes_positive")
+)
+```
+
+##### numeric table
+Patients receiving chemotherapy were significantly younger (mean age 53.6 vs 66.1 years, p < 0.001) and had more aggressive tumor features, including larger tumor size, greater lymph node involvement, and higher histologic grade (all p < 0.001). Pre-menopausal status was also more common among patients receiving chemotherapy (38.2% vs 8.0%, p < 0.001). HER2 status and PR status did not significantly differ between treatment groups.
+
+These findings suggest that treatment assignment was strongly associated with baseline risk factors.
+
+```{r}
+summary_table <- function(data, vars, group_var = "trt_group") {
+  
+  out <- lapply(vars, function(v) {
+    x <- data[[v]]
+    g <- data[[group_var]]
+    
+    g1 <- as.numeric(x[g == "Hormone only"])
+    g2 <- as.numeric(x[g == "Hormone + Chemo"])
+    
+    ttest <- t.test(g1, g2)
+    
+    mean1 <- mean(g1, na.rm = TRUE)
+    sd1 <- sd(g1, na.rm = TRUE)
+    mean2 <- mean(g2, na.rm = TRUE)
+    sd2 <- sd(g2, na.rm = TRUE)
+    smd <- (mean2 - mean1) / sqrt((sd1^2 + sd2^2) / 2)
+    
+    data.frame(
+      Variable = v,
+      Mean_Group1 = mean1,
+      SD_Group1 = sd1,
+      Mean_Group2 = mean2,
+      SD_Group2 = sd2,
+      t_value = as.numeric(ttest$statistic),
+      p_value = ttest$p.value,
+      SMD = smd
+    )
+  })
+  
+  dplyr::bind_rows(out)
+}
+
+cont_vars <- c("age", "tumor_size", "nodes_positive")
+
+cont_table <- summary_table(dat_table1, cont_vars) |>
+  dplyr::mutate(
+    across(where(is.numeric), ~round(.x, 3))
+  )
+
+print(cont_table)
+```
+
+
+##### categorical table
+```{r}
+categorical_table <- function(data, vars, group_var = "trt_group") {
+  
+  out <- lapply(vars, function(v) {
+    x <- data[[v]]
+    g <- data[[group_var]]
+    
+    # 变成字符，保留 NA 为单独一类
+    x_chr <- as.character(x)
+    x_chr[is.na(x_chr)] <- "Missing"
+    
+    g_chr <- as.character(g)
+    
+    tab <- table(x_chr, g_chr)
+    prop <- prop.table(tab, margin = 2) * 100
+    
+    # 自动选择检验
+    test <- if (any(tab < 5)) fisher.test(tab) else chisq.test(tab)
+    
+    stat_value <- if ("statistic" %in% names(test)) as.numeric(test$statistic) else NA_real_
+    p_value <- test$p.value
+    
+    # 防止列名顺序或缺失导致报错
+    n1 <- if ("Hormone only" %in% colnames(tab)) tab[, "Hormone only"] else rep(0, nrow(tab))
+    n2 <- if ("Hormone + Chemo" %in% colnames(tab)) tab[, "Hormone + Chemo"] else rep(0, nrow(tab))
+    
+    p1 <- if ("Hormone only" %in% colnames(prop)) prop[, "Hormone only"] else rep(0, nrow(prop))
+    p2 <- if ("Hormone + Chemo" %in% colnames(prop)) prop[, "Hormone + Chemo"] else rep(0, nrow(prop))
+    
+    df <- data.frame(
+      Variable = v,
+      Level = rownames(tab),
+      n_Group1 = as.numeric(n1),
+      pct_Group1 = as.numeric(p1),
+      n_Group2 = as.numeric(n2),
+      pct_Group2 = as.numeric(p2),
+      statistic = NA_real_,
+      p_value = NA_real_,
+      stringsAsFactors = FALSE
+    )
+    
+    # 只在每个变量第一行放检验结果
+    df$statistic[1] <- stat_value
+    df$p_value[1] <- p_value
+    
+    df
+  })
+  
+  dplyr::bind_rows(out)
+}
+
+cat_vars <- c(
+  "grade",
+  "her2",
+  "pam50",
+  "tumor_stage",
+  "menopausal_state",
+  "pr_status",
+  "surgery",
+  "radio_therapy"
+)
+
+cat_table <- categorical_table(dat_table1, cat_vars) |>
+  dplyr::mutate(
+    dplyr::across(where(is.numeric), ~round(.x, 3))
+  )
+
+print(cat_table)
+```
+
+
+
+
+### gene variable selection: LASSO/SCAD/MCP/coxBAR
+
+
+
