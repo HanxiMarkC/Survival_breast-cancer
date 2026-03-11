@@ -1,5 +1,5 @@
 ---
-title: "Project part"
+title: "Project part Mark"
 author: "Hanxi Chen"
 subtitle: :)
 date: today
@@ -313,7 +313,477 @@ print(cat_table)
 
 
 
-### gene variable selection: LASSO/SCAD/MCP/coxBAR
+## gene variable selection: LASSO/SCAD/MCP/coxBAR
+Apply the following penalized regression methods for variable selection:
+
+• LASSO (Least Absolute Shrinkage and Selection Operator)
+• BAR (Broken Adaptive Ridge)
+• SCAD (Smoothly Clipped Absolute Deviation)
+• MCP (Minimax Concave Penalty)
+```{r}
+library(ncvreg)
+```
+### set up dataset for penalized regression
+331 gene expression z-scores: numeric
+175 gene mutation variables: either 0 or "strings", which represents whether the gene mutates and the mutation type. Strings cannot pass into cox penalized regression due to categorical high-cardinality, and each mutation type have very few samples, so penalized cox regression cannot be able to handle them. To address this problem, we would re-encode them to:
+= 1 if mutated, or = 0 if no mutation.
+
+
+We would also restrict the sample to ER+ and hormone_therapy ==1 only, same as our analysis cohort.
+```{r}
+dat_gene0 <- dat0 %>%
+  select(
+    patient_id,
+    er_status,
+    hormone_therapy,
+    chemotherapy,
+    os_months = overall_survival_months,
+    os_event = overall_survival,
+    brca1:siah1_mut
+  )
+
+dat_gene1 <- dat_gene0 %>%
+  mutate(
+    across(where(is.character), ~na_if(.x, "")),
+    across(c(er_status, hormone_therapy, chemotherapy), as.character),
+    across(c(os_months, os_event), as.numeric),
+    across(brca1:ugt2b7, as.numeric),
+    across(
+      pik3ca_mut:siah1_mut,
+      ~case_when(
+        is.na(.x) ~ NA_real_,
+        .x == "0" ~ 0,
+        TRUE ~ 1
+      )
+    )
+  )
+
+dat_lasso0 <- dat_gene1 %>%
+  filter(
+    er_status == "Positive",
+    hormone_therapy == 1
+  ) %>%
+  filter(
+    !is.na(chemotherapy),
+    !is.na(os_months),
+    !is.na(os_event)
+  )
+```
+
+```{r}
+gene_df <- dat_lasso0 %>%
+  select(brca1:siah1_mut)
+
+col_na <- colSums(is.na(gene_df))
+
+col_var0 <- sapply(gene_df, function(x) var(x, na.rm = TRUE))
+table(col_var0 == 0)
+
+keep_gene <- names(gene_df)[col_na == 0 & col_var0 > 0]
+
+dat_lasso <- dat_lasso0 %>%
+  select(patient_id, er_status, hormone_therapy, chemotherapy, os_months, os_event,
+         all_of(keep_gene))
+```
+
+```{r}
+X <- dat_lasso %>%
+  select(all_of(keep_gene)) %>%
+  as.data.frame() %>%
+  as.matrix()
+
+sum(is.na(X)) # should be 0
+dim(X) # should be 662-2 = 660
+X <- scale(X)
+```
+### LASSO
+```{r}
+library(ncvreg)
+
+set.seed(215)
+
+fit <- cv.ncvsurv(
+  X,
+  Surv(dat_lasso$os_months, dat_lasso$os_event),
+  penalty = "lasso",
+  nlambda = 50,
+  nfolds = 10
+)
+```
+```{r}
+fit.lasso <- ncvsurv(
+  X,
+  Surv(dat_lasso$os_months, dat_lasso$os_event),
+  penalty = "lasso",
+  lambda = fit$lambda.min
+)
+
+fit$lambda.min
+range(fit$lambda)
+
+which.min(abs(fit$lambda - fit$lambda.min))
+length(fit$lambda)
+```
+selected:
+```{r}
+lasso_coef <- coef(fit.lasso)
+
+lasso_selected <- names(lasso_coef)[lasso_coef != 0]
+
+lasso_selected
+
+lasso_selected_df <- data.frame(
+  variable = names(lasso_coef)[lasso_coef != 0],
+  coef = lasso_coef[lasso_coef != 0]
+) %>%
+  arrange(desc(abs(coef)))
+
+lasso_selected_df
+```
+
+### SCAD
+```{r}
+set.seed(215)
+
+fit <- cv.ncvsurv(
+  X,
+  Surv(dat_lasso$os_months, dat_lasso$os_event),
+  penalty = "SCAD",
+  nlambda = 50,
+  nfolds = 10
+)
+
+# check ups (avoid the case if only a few fits worked)
+fit$lambda.min
+range(fit$lambda)
+
+which.min(abs(fit$lambda - fit$lambda.min))
+length(fit$lambda)
+```
+
+```{r, warning=FALSE}
+fit.scad <- ncvsurv(
+  X,
+  Surv(dat_lasso$os_months, dat_lasso$os_event),
+  penalty = "SCAD",
+  lambda = fit$lambda.min
+)
+```
+
+```{r}
+scad_coef <- coef(fit.scad)
+
+scad_selected <- names(scad_coef)[scad_coef != 0]
+
+scad_selected
+
+scad_selected_df <- data.frame(
+  variable = names(scad_coef)[scad_coef != 0],
+  coef = scad_coef[scad_coef != 0]
+) %>%
+  arrange(desc(abs(coef)))
+
+scad_selected_df
+```
+
+### MCP
+```{r}
+set.seed(215)
+
+fit <- cv.ncvsurv(
+  X,
+  Surv(dat_lasso$os_months, dat_lasso$os_event),
+  penalty = "MCP",
+  nlambda = 50,
+  nfolds = 10
+)
+
+fit$lambda.min
+range(fit$lambda)
+
+which.min(abs(fit$lambda - fit$lambda.min))
+length(fit$lambda)
+```
+
+```{r, warning=FALSE}
+fit.mcp <- ncvsurv(
+  X,
+  Surv(dat_lasso$os_months, dat_lasso$os_event),
+  penalty = "MCP",
+  lambda = fit$lambda.min
+)
+```
+
+```{r}
+mcp_coef <- coef(fit.mcp)
+
+mcp_selected <- names(mcp_coef)[mcp_coef != 0]
+
+mcp_selected
+
+mcp_selected_df <- data.frame(
+  variable = names(mcp_coef)[mcp_coef != 0],
+  coef = mcp_coef[mcp_coef != 0]
+) %>%
+  arrange(desc(abs(coef)))
+
+mcp_selected_df
+```
+
+### coxBAR
+```{r}
+library(Cyclops)
+library(BrokenAdaptiveRidge)
+```
+
+```{r}
+library(Cyclops)
+library(BrokenAdaptiveRidge)
+library(survival)
+
+set.seed(215)
+
+ncov <- ncol(X)
+n <- nrow(X)
+
+dataFit <- createCyclopsData(
+  Surv(dat_lasso$os_months, dat_lasso$os_event) ~ X,
+  modelType = "cox"
+)
+
+pen_grid <- exp(seq(log(0.1 * log(ncov)), log(1 * log(ncov)), length.out = 50))
+
+coxbar_grid <- lapply(pen_grid, function(pen) {
+
+  barPrior <- createBarPrior(
+    penalty = pen,
+    initialRidgeVariance = 1 / pen
+  )
+
+  fit.bar <- try(
+    fitCyclopsModel(dataFit, prior = barPrior),
+    silent = TRUE
+  )
+
+  if(inherits(fit.bar, "try-error")) {
+    return(list(
+      penalty = pen,
+      fit = NULL,
+      bic = Inf,
+      refit_warn = FALSE,
+      refit_ok = FALSE
+    ))
+  }
+
+  coef_bar <- try(coef(fit.bar), silent = TRUE)
+
+  if(inherits(coef_bar, "try-error") || is.null(coef_bar)) {
+    return(list(
+      penalty = pen,
+      fit = NULL,
+      bic = Inf,
+      refit_warn = FALSE,
+      refit_ok = FALSE
+    ))
+  }
+
+  selected_idx <- which(coef_bar != 0)
+  k <- length(selected_idx)
+
+  if(k == 0) {
+    fit_null <- coxph(Surv(os_months, os_event) ~ 1, data = dat_lasso)
+
+    bic <- -2 * as.numeric(logLik(fit_null)) + log(n) * k
+
+    return(list(
+      penalty = pen,
+      fit = fit.bar,
+      bic = bic,
+      refit_warn = FALSE,
+      refit_ok = TRUE
+    ))
+  } else {
+
+    dat_bar <- data.frame(
+      os_months = dat_lasso$os_months,
+      os_event = dat_lasso$os_event,
+      X[, selected_idx, drop = FALSE]
+    )
+
+    colnames(dat_bar)[3:ncol(dat_bar)] <- colnames(X)[selected_idx]
+
+    warn_msg <- NULL
+
+    fit_refit <- tryCatch(
+      withCallingHandlers(
+        coxph(
+          as.formula(
+            paste(
+              "Surv(os_months, os_event) ~",
+              paste(colnames(X)[selected_idx], collapse = " + ")
+            )
+          ),
+          data = dat_bar
+        ),
+        warning = function(w) {
+          warn_msg <<- conditionMessage(w)
+          invokeRestart("muffleWarning")
+        }
+      ),
+      error = function(e) NULL
+    )
+
+    if(is.null(fit_refit)) {
+      bic <- Inf
+      refit_ok <- FALSE
+    } else {
+      bic <- -2 * as.numeric(logLik(fit_refit)) + log(n) * k
+      refit_ok <- TRUE
+    }
+
+    return(list(
+      penalty = pen,
+      fit = fit.bar,
+      bic = bic,
+      refit_warn = !is.null(warn_msg),
+      warn_msg = warn_msg,
+      refit_ok = refit_ok
+    ))
+  }
+})
+```
+
+```{r}
+bic_values <- sapply(coxbar_grid, function(x) x$bic)
+
+best_index <- which.min(bic_values)
+
+pen_grid[best_index]
+range(pen_grid)
+
+best_index
+length(pen_grid)
+```
+
+best fit:
+```{r}
+fit.coxbar <- coxbar_grid[[best_index]]$fit
+
+coef_bar <- coef(fit.coxbar)
+```
+
+selected vars:
+```{r}
+coxbar_selected <- colnames(X)[coef_bar != 0]
+
+coxbar_selected
+
+coxbar_selected_df <- data.frame(
+  variable = colnames(X)[coef_bar != 0],
+  coef = coef_bar[coef_bar != 0]
+) %>%
+  arrange(desc(abs(coef)))
+
+coxbar_selected_df
+```
+
+```{r}
+sum(is.infinite(bic_values))
+
+sum(sapply(coxbar_grid, function(x) x$refit_warn), na.rm = TRUE)
+
+sum(sapply(coxbar_grid, function(x) x$refit_ok), na.rm = TRUE)
+```
+only 2 runs failed out of 50 penalties, all good;
+only 1 run had infinite coefficient warning, ignorable;
+48 runs of different penalties have good refit Cox models.
+
+### compare methods
+```{r}
+gene_sets <- list(
+  lasso = lasso_selected,
+  scad = scad_selected,
+  mcp = mcp_selected,
+  coxbar = coxbar_selected
+)
+```
+
+```{r}
+refit_compare <- lapply(names(gene_sets), function(m) {
+
+  vars <- gene_sets[[m]]
+
+  dat_tmp <- dat_lasso %>%
+    select(os_months, os_event, all_of(vars))
+
+  fit_tmp <- coxph(
+    as.formula(
+      paste("Surv(os_months, os_event) ~", paste(vars, collapse = " + "))
+    ),
+    data = dat_tmp
+  )
+
+  data.frame(
+    method = m,
+    n_var = length(vars),
+    logLik = as.numeric(logLik(fit_tmp)),
+    AIC = AIC(fit_tmp),
+    BIC = BIC(fit_tmp)
+  )
+}) %>%
+  bind_rows() %>%
+  arrange(BIC)
+
+refit_compare
+```
+
+
+### select vars
+Our aim is to select 5~8 final gene variables to enter the cox model.
+
+
+why choose coxBAR as main model (除了BIC最小最好之外):
+Because our goal was sparse and stable variable screening in a correlated genomic setting, we treated CoxBAR as the primary penalized Cox selection method. CoxBAR is a surrogate ℓ0 penalized Cox approach based on broken adaptive ridge and has been shown to possess selection consistency, oracle property for parameter estimation, and a grouping property for highly correlated covariates. In simulation and empirical evaluations, BAR based Cox regression selected relatively sparse models and achieved model selection and discriminatory performance comparable to or slightly better than Cox LASSO, with less biased and more stable solution paths under BIC based tuning.
+
+Summarize selected variables overlapping:
+```{r}
+all_selected <- list(
+  lasso = lasso_selected,
+  scad = scad_selected,
+  mcp = mcp_selected,
+  coxbar = coxbar_selected
+)
+
+all_genes <- sort(unique(unlist(all_selected)))
+
+overlap_df <- data.frame(variable = all_genes) %>%
+  mutate(
+    in_lasso = variable %in% lasso_selected,
+    in_scad = variable %in% scad_selected,
+    in_mcp = variable %in% mcp_selected,
+    in_coxbar = variable %in% coxbar_selected,
+    n_methods = in_lasso + in_scad + in_mcp + in_coxbar
+  ) %>%
+  arrange(desc(n_methods), variable)
+
+overlap_df
+```
+
+
+在 4 个方法都出现 的变量是：
+tsc2, bbc3, sbno1, ptprd_mut, nek1_mut
+
+再从 coxBAR 中那些 出现了 3 次 的变量里补 1 到 2 个，例如：
+
+mapk14, kmt2c, casp8, hsd17b4
+
+这样最后凑成 6 到 7 个：
+tsc2, bbc3, sbno1, ptprd_mut, nek1_mut, mapk14, kmt2c (coxBAR里最重要的那两个)
+
+这组有两个优点。第一，完全以 coxBAR 为主。第二，稳定性很强，因为这 7 个里前 5 个在所有方法都出现，后 2 个也在 3 个方法里出现。
+
+
+最后选出来的变量：tsc2, bbc3, sbno1, ptprd_mut, nek1_mut, mapk14, kmt2c。注意ptprd_mut和 nek1_mut变量的原始格式是0或string，要把string全变成1，代表有突变，0代表无突变，再加入我们的cox model作为协变量。
 
 
 
