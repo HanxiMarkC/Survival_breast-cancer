@@ -1,6 +1,6 @@
 ---
-title: "Project part Mark"
-author: "Hanxi Chen"
+title: "Project part Total"
+author: "Hanxi Chen, Hanying Xu, Xiaomiao Wang"
 subtitle: :)
 date: today
 format:
@@ -59,11 +59,12 @@ library(gtsummary)
 METABRIC_RNA_Mutation <- read.csv("METABRIC_RNA_Mutation.csv")
 ```
 
+
 ```{r}
 dat0 <- METABRIC_RNA_Mutation %>%
   as_tibble()
 
-# rename
+# rename variables
 dat1 <- dat0 %>%
   transmute(
     patient_id,
@@ -86,7 +87,7 @@ dat1 <- dat0 %>%
     radio_therapy
   )
 
-# cleaning
+# cleaning variables
 dat2 <- dat1 %>%
   mutate(
     across(where(is.character), ~na_if(.x, "")),
@@ -158,10 +159,12 @@ missing_by_group_long <- dat_table1 %>%
 missing_by_group_long
 ```
 
+
+
 ## Table 1: covariate distributions over Trt Groups
 
 ```{r}
-# 废案
+# raw version
 vars <- c(
   "age", "tumor_size", "nodes_positive",
   "grade", "her2", "pam50", "tumor_stage",
@@ -247,7 +250,7 @@ categorical_table <- function(data, vars, group_var = "trt_group") {
     x <- data[[v]]
     g <- data[[group_var]]
     
-    # 变成字符，保留 NA 为单独一类
+    # convert to character and keep missing as a level
     x_chr <- as.character(x)
     x_chr[is.na(x_chr)] <- "Missing"
     
@@ -256,13 +259,13 @@ categorical_table <- function(data, vars, group_var = "trt_group") {
     tab <- table(x_chr, g_chr)
     prop <- prop.table(tab, margin = 2) * 100
     
-    # 自动选择检验
+    # choose test automatically
     test <- if (any(tab < 5)) fisher.test(tab) else chisq.test(tab)
     
     stat_value <- if ("statistic" %in% names(test)) as.numeric(test$statistic) else NA_real_
     p_value <- test$p.value
     
-    # 防止列名顺序或缺失导致报错
+    # avoid errors from missing group columns
     n1 <- if ("Hormone only" %in% colnames(tab)) tab[, "Hormone only"] else rep(0, nrow(tab))
     n2 <- if ("Hormone + Chemo" %in% colnames(tab)) tab[, "Hormone + Chemo"] else rep(0, nrow(tab))
     
@@ -281,7 +284,7 @@ categorical_table <- function(data, vars, group_var = "trt_group") {
       stringsAsFactors = FALSE
     )
     
-    # 只在每个变量第一行放检验结果
+    # put test results on the first row only
     df$statistic[1] <- stat_value
     df$p_value[1] <- p_value
     
@@ -310,11 +313,672 @@ cat_table <- categorical_table(dat_table1, cat_vars) |>
 print(cat_table)
 ```
 
+### RMST
+```{r}
+ps_vars <- c(
+  "chemo",
+  "trt_group",
+  "os_months",
+  "os_event",
+  "age",
+  "tumor_size",
+  "nodes_positive",
+  "grade",
+  "pam50"
+)
+
+dat_km <- dat_table1 %>%
+  select(all_of(ps_vars)) %>%
+  filter(
+    !is.na(chemo),
+    !is.na(os_months),
+    !is.na(os_event),
+    !is.na(age),
+    !is.na(tumor_size),
+    !is.na(nodes_positive),
+    !is.na(grade),
+    !is.na(pam50)
+  ) %>%
+  mutate(
+    chemo = as.numeric(chemo)
+  )
+```
+
+```{r}
+library(survRM2)
+rmst_res <- rmst2(
+  time   = dat_km$os_months,
+  status = dat_km$os_event,
+  arm    = dat_km$chemo,
+  tau    = 100
+)
+rmst_res
+```
 
 
 
-## gene variable selection: LASSO/SCAD/MCP/coxBAR
-Apply the following penalized regression methods for variable selection:
+## Crude KM & Log-rank test: unadjusted association
+### KM curve
+The Kaplan–Meier estimator was used to estimate the survival function for each treatment group.
+The log-rank test was used to compare the survival distributions between treatment groups.
+```{r}
+library(survival)
+library(survminer)
+```
+
+```{r}
+ps_vars <- c(
+  "chemo",
+  "trt_group",
+  "os_months",
+  "os_event",
+  "age",
+  "tumor_size",
+  "nodes_positive",
+  "grade",
+  "pam50"
+)
+
+dat_km <- dat_table1 %>%
+  select(all_of(ps_vars)) %>%
+  filter(
+    !is.na(chemo),
+    !is.na(os_months),
+    !is.na(os_event),
+    !is.na(age),
+    !is.na(tumor_size),
+    !is.na(nodes_positive),
+    !is.na(grade),
+    !is.na(pam50)
+  ) %>%
+  mutate(
+    chemo = as.numeric(chemo)
+  )
+  
+
+
+table(dat_km$trt_group)
+prop.table(table(dat_km$trt_group))
+```
+
+```{r}
+tau <- 100
+
+fit_km <- survfit(
+  Surv(os_months, os_event) ~ trt_group,
+  data = dat_km
+)
+
+ggsurvplot(
+  fit_km,
+  data = dat_km,
+  risk.table = TRUE,
+  pval = TRUE,
+  conf.int = TRUE,
+  xlab = "Time since diagnosis (months)",
+  ylab = "Overall survival probability",
+  legend.title = "Treatment group",
+  legend.labs = c("Hormone only", "Hormone + Chemo"),
+  xlim = c(0, tau),
+  break.time.by = 25,
+  ggtheme = theme_bw()
+)
+
+summary(fit_km, times = tau)
+```
+
+The crude Kaplan-Meier curves suggested worse survival in the chemotherapy group. However, this comparison is unadjusted and may reflect baseline differences in disease severity rather than treatment effect.
+
+```{r}
+survdiff(Surv(os_months, os_event) ~ trt_group, data = dat_km)
+```
+
+
+## Weighted KM and Log-rank Test
+### calculate propensity score
+set up dataset for Propensity score models:
+```{r}
+ps_vars <- c(
+  "chemo",
+  "trt_group",
+  "os_months",
+  "os_event",
+  "age",
+  "tumor_size",
+  "nodes_positive",
+  "grade",
+  "pam50"
+)
+
+dat_ps <- dat_table1 %>%
+  select(all_of(ps_vars)) %>%
+  mutate(
+    pam50_grp = case_when(
+      pam50 %in% c("LumA", "LumB") ~ pam50,
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(
+    !is.na(chemo),
+    !is.na(os_months),
+    !is.na(os_event),
+    !is.na(age),
+    !is.na(tumor_size),
+    !is.na(nodes_positive),
+    !is.na(grade),
+    !is.na(pam50_grp)
+  ) %>%
+  mutate(
+    chemo = as.numeric(chemo),
+    grade = factor(grade),
+    pam50_grp = factor(pam50_grp, levels = c("LumA", "LumB", "Other"))
+  )
+  
+
+nrow(dat_table1)
+nrow(dat_ps)
+
+table(dat_ps$trt_group)
+prop.table(table(dat_ps$trt_group))
+```
+
+### fit propensity score model and calculate IPTW
+A logistic regression model was used to estimate the propensity score for receiving chemotherapy.
+```{r}
+ps_fit <- glm(
+  chemo ~ age + tumor_size + nodes_positive + grade + pam50_grp,
+  data = dat_ps,
+  family = binomial()
+)
+
+summary(ps_fit)
+```
+
+calculate stabilized IPTW:
+```{r}
+dat_ps <- dat_ps %>%
+  mutate(
+    ps = predict(ps_fit, type = "response"),
+    p_treat = mean(chemo == 1),
+    sw = if_else(
+      chemo == 1,
+      p_treat / ps,
+      (1 - p_treat) / (1 - ps)
+    ),
+    iptw = if_else(
+      chemo == 1,
+      1 / ps,
+      1 / (1 - ps)
+    )
+  )
+```
+
+### check overlap
+```{r}
+dat_ps %>%
+  group_by(trt_group) %>%
+  summarise(
+    n = n(),
+    min_ps = min(ps),
+    q1_ps = quantile(ps, 0.25),
+    median_ps = median(ps),
+    mean_ps = mean(ps),
+    q3_ps = quantile(ps, 0.75),
+    max_ps = max(ps)
+  )
+```
+
+```{r}
+ggplot(dat_ps, aes(x = ps, fill = trt_group)) +
+  geom_density(alpha = 0.35) +
+  labs(
+    x = "Propensity score",
+    y = "Density",
+    fill = "Treatment group"
+  ) +
+  theme_bw()
+```
+
+
+```{r}
+ps_range <- dat_ps %>%
+  group_by(trt_group) %>%
+  summarise(
+    min_ps = min(ps),
+    max_ps = max(ps)
+  )
+
+ps_range
+```
+
+check weight distribution:
+```{r}
+summary(dat_ps$sw)
+quantile(dat_ps$sw, probs = c(0, 0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99, 1))
+```
+
+```{r}
+ggplot(dat_ps, aes(x = sw, fill = trt_group)) +
+  geom_histogram(position = "identity", alpha = 0.35, bins = 30) +
+  labs(
+    x = "Stabilized IPTW",
+    y = "Count",
+    fill = "Treatment group"
+  ) +
+  theme_bw()
+```
+
+balance before weighting:
+```{r}
+vars_balance <- c(
+  "age",
+  "tumor_size",
+  "nodes_positive",
+  "grade",
+  "pam50_grp"
+)
+
+factorVars_balance <- c(
+  "grade",
+  "pam50_grp"
+)
+
+tab_unw <- CreateTableOne(
+  vars = vars_balance,
+  strata = "trt_group",
+  data = dat_ps,
+  factorVars = factorVars_balance,
+  includeNA = TRUE,
+  smd = TRUE
+)
+
+print(
+  tab_unw,
+  showAllLevels = TRUE,
+  quote = FALSE,
+  noSpaces = TRUE,
+  smd = TRUE,
+  nonnormal = c("tumor_size", "nodes_positive")
+)
+```
+
+balance after weighting:
+```{r}
+library(survey)
+
+design_sw <- svydesign(
+  ids = ~1,
+  weights = ~sw,
+  data = dat_ps
+)
+
+tab_w <- svyCreateTableOne(
+  vars = vars_balance,
+  strata = "trt_group",
+  data = design_sw,
+  factorVars = factorVars_balance,
+  includeNA = TRUE,
+  smd = TRUE
+)
+
+print(
+  tab_w,
+  showAllLevels = TRUE,
+  quote = FALSE,
+  noSpaces = TRUE,
+  smd = TRUE,
+  nonnormal = c("tumor_size", "nodes_positive")
+)
+```
+### compare SMD before and after weighting
+SMD < 0.1 → ideal
+SMD < 0.2 → acceptable
+SMD > 0.2 → imbalance
+```{r}
+smd_unw <- ExtractSmd(tab_unw)
+smd_w <- ExtractSmd(tab_w)
+
+smd_compare <- data.frame(
+  variable = vars_balance,
+  smd_unweighted = as.numeric(smd_unw),
+  smd_weighted = as.numeric(smd_w)
+) %>%
+  arrange(desc(smd_unweighted))
+
+smd_compare
+```
+
+```{r}
+smd_compare %>%
+  mutate(
+    imbalance_unweighted = abs(smd_unweighted) > 0.1,
+    imbalance_weighted = abs(smd_weighted) > 0.1
+  )
+```
+
+We estimated a propensity score for receiving chemotherapy using baseline clinical covariates age, tumor size, number of positive lymph nodes, histologic grade, and PAM50 subtype, then constructed stabilized inverse probability of treatment weights. The propensity score distributions showed adequate overlap between treatment groups, although the chemotherapy group had generally larger scores, consistent with confounding by indication. The stabilized weights were overall well behaved, with mean close to 1 and only a few large values, suggesting that the weighted analysis should be reasonably stable. Covariate balance improved meaningfully after weighting, especially for nodal involvement and tumor size, while some residual imbalance remained for age, grade, and PAM50. Overall, these diagnostics suggest that IPTW is appropriate as an adjusted survival comparison, while residual confounding should still be acknowledged.
+
+
+### IPTW weighted KM
+```{r}
+# fit weighted km curves
+fit_km_w <- survfit(
+  Surv(os_months, os_event) ~ trt_group,
+  data = dat_ps,
+  weights = sw
+)
+
+ggsurvplot(
+  fit_km_w,
+  data = dat_ps,
+  conf.int = TRUE,
+  xlab = "Time since diagnosis (months)",
+  ylab = "Overall survival probability",
+  legend.title = "Treatment group",
+  legend.labs = c("Hormone only", "Hormone + Chemo"),
+  xlim = c(0, tau),
+  break.time.by = 25,
+  ggtheme = theme_bw()
+)
+
+summary(fit_km_w, times = tau)
+
+```
+
+
+```{r}
+kmw_150 <- summary(fit_km_w, times = tau)
+
+data.frame(
+  trt_group = kmw_150$strata,
+  time = kmw_150$time,
+  surv = kmw_150$surv,
+  lower = kmw_150$lower,
+  upper = kmw_150$upper
+)
+```
+
+
+```{r}
+ggsurvplot(
+  fit_km_w,
+  data = dat_ps,
+  conf.int = TRUE,
+  title = "Weighted Kaplan–Meier Survival Curves by Treatment Group",
+  xlab = "Time since diagnosis (months)",
+  ylab = "Overall survival probability",
+  legend.title = "Treatment group",
+  legend.labs = c("Hormone only", "Hormone + Chemo"),
+  xlim = c(0, tau),
+  break.time.by = 25,
+  ggtheme = theme_bw()
+)
+```
+
+### IPTW weighted logrank
+```{r}
+design_sw <- svydesign(
+  ids = ~1,
+  weights = ~sw,
+  data = dat_ps
+)
+```
+
+```{r}
+library(survey)
+
+fit_wlr <- svylogrank(
+  Surv(os_months, os_event) ~ trt_group,
+  design = design_sw
+)
+
+fit_wlr
+```
+
+### IPTW weighted cox
+```{r}
+dat_wcox <- dat_table1 %>%
+  select(
+    patient_id,
+    chemo,
+    trt_group,
+    os_months,
+    os_event,
+    age,
+    tumor_size,
+    nodes_positive,
+    grade,
+    pam50
+  ) %>%
+  mutate(
+    pam50_grp = case_when(
+      pam50 %in% c("LumA", "LumB") ~ pam50,
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(
+    !is.na(patient_id),
+    !is.na(chemo),
+    !is.na(os_months),
+    !is.na(os_event),
+    !is.na(age),
+    !is.na(tumor_size),
+    !is.na(nodes_positive),
+    !is.na(grade),
+    !is.na(pam50_grp)
+  ) %>%
+  mutate(
+    chemo = as.numeric(chemo),
+    grade = factor(grade),
+    pam50_grp = factor(pam50_grp, levels = c("LumA", "LumB", "Other"))
+  )
+```
+
+
+```{r}
+ps_fit <- glm(
+  chemo ~ age + tumor_size + nodes_positive + grade + pam50_grp,
+  data = dat_wcox,
+  family = binomial()
+)
+
+dat_wcox <- dat_wcox %>%
+  mutate(
+    ps = predict(ps_fit, type = "response"),
+    p_treat = mean(chemo == 1),
+    sw = if_else(
+      chemo == 1,
+      p_treat / ps,
+      (1 - p_treat) / (1 - ps)
+    )
+  )
+```
+
+#### weighted cox without time-dependent chemotherapy:
+```{r}
+cox_w <- coxph(
+  Surv(os_months, os_event) ~
+    chemo +
+    age +
+    tumor_size +
+    nodes_positive +
+    grade +
+    pam50_grp,
+  data = dat_wcox,
+  weights = sw,
+  ties = "breslow",
+  robust = TRUE,
+  id = patient_id
+)
+
+summary(cox_w)
+```
+
+```{r}
+ph_test_w <- cox.zph(cox_w)
+ph_test_w
+```
+
+```{r}
+event.times <- sort(unique(dat_wcox$os_months[dat_wcox$os_event == 1]))
+event.times <- event.times[-1]
+
+dat_split_w <- survSplit(
+  data = dat_wcox,
+  cut = event.times,
+  end = "os_months",
+  start = "t0",
+  event = "os_event"
+)
+```
+
+```{r}
+dat_split_w <- dat_split_w %>%
+  mutate(
+    chemo_t = chemo * log(os_months)
+  )
+```
+
+#### weighted cox with time-dependent chemotherapy
+```{r}
+cox_w_td <- coxph(
+  Surv(t0, os_months, os_event) ~
+    chemo +
+    chemo_t +
+    age +
+    tumor_size +
+    nodes_positive +
+    grade +
+    pam50_grp,
+  data = dat_split_w,
+  weights = sw,
+  ties = "breslow",
+  robust = TRUE,
+  id = patient_id
+)
+
+summary(cox_w_td)
+```
+#### clinical-only crude Cox
+```{r}
+# set up data for clinical-only crude cox
+dat_ccox <- dat_table1 %>%
+  select(
+    patient_id,
+    chemo,
+    trt_group,
+    os_months,
+    os_event,
+    age,
+    tumor_size,
+    nodes_positive,
+    grade,
+    pam50
+  ) %>%
+  mutate(
+    pam50_grp = case_when(
+      pam50 %in% c("LumA", "LumB") ~ pam50,
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(
+    !is.na(patient_id),
+    !is.na(chemo),
+    !is.na(os_months),
+    !is.na(os_event),
+    !is.na(age),
+    !is.na(tumor_size),
+    !is.na(nodes_positive),
+    !is.na(grade),
+    !is.na(pam50_grp)
+  ) %>%
+  mutate(
+    chemo = factor(
+      as.numeric(chemo),
+      levels = c(0, 1),
+      labels = c("Hormone only", "Hormone + Chemo")
+    ),
+    chemo_num = as.numeric(chemo == "Hormone + Chemo"),
+    grade = factor(grade),
+    pam50_grp = factor(pam50_grp, levels = c("LumA", "LumB", "Other"))
+  )
+
+nrow(dat_ccox)
+table(dat_ccox$chemo, useNA = "ifany")
+table(dat_ccox$grade, useNA = "ifany")
+table(dat_ccox$pam50_grp, useNA = "ifany")
+```
+
+
+```{r}
+# fit clinical-only crude cox
+ccox_fit <- coxph(
+  Surv(os_months, os_event) ~
+    chemo +
+    age +
+    tumor_size +
+    nodes_positive +
+    grade +
+    pam50_grp,
+  data = dat_ccox,
+  ties = "breslow"
+)
+
+summary(ccox_fit)
+```
+
+```{r}
+# check ph assumption
+ccox_ph_res <- cox.zph(ccox_fit)
+ccox_ph_res
+plot(ccox_ph_res)
+```
+
+#### clinical-only time-dependent cox
+```{r}
+# set up time-dependent crude cox
+ccox_event_times <- sort(unique(dat_ccox$os_months[dat_ccox$os_event == 1]))
+ccox_event_times <- ccox_event_times[-1]
+
+dat_ccox_split <- survSplit(
+  data = dat_ccox,
+  cut = ccox_event_times,
+  end = "os_months",
+  start = "t0",
+  event = "os_event"
+) %>%
+  mutate(
+    chemo_t = chemo_num * log(os_months)
+  )
+```
+
+```{r}
+# fit time-dependent crude cox
+ccox_td_fit <- coxph(
+  Surv(t0, os_months, os_event) ~
+    chemo_num +
+    chemo_t +
+    age +
+    tumor_size +
+    nodes_positive +
+    grade +
+    pam50_grp,
+  data = dat_ccox_split,
+  ties = "breslow"
+)
+
+summary(ccox_td_fit)
+```
+
+```{r}
+# check ph for td crude cox
+ccox_td_ph_res <- cox.zph(ccox_td_fit)
+ccox_td_ph_res
+plot(ccox_td_ph_res)
+```
+
+## Gene variable selection: LASSO/SCAD/MCP/coxBAR
+The following penalized regression methods were applied for gene selection:
 
 • LASSO (Least Absolute Shrinkage and Selection Operator)
 • BAR (Broken Adaptive Ridge)
@@ -323,10 +987,11 @@ Apply the following penalized regression methods for variable selection:
 ```{r}
 library(ncvreg)
 ```
-### set up dataset for penalized regression
-331 gene expression z-scores: numeric
-175 gene mutation variables: either 0 or "strings", which represents whether the gene mutates and the mutation type. Strings cannot pass into cox penalized regression due to categorical high-cardinality, and each mutation type have very few samples, so penalized cox regression cannot be able to handle them. To address this problem, we would re-encode them to:
-= 1 if mutated, or = 0 if no mutation.
+
+### set up data for penalized regression
+The gene data include 331 gene expression z-scores and 175 mutation variables. The expression variables are numeric, whereas the mutation variables are recorded as either 0 or mutation-type strings. Because mutation-type strings are too sparse and high-dimensional for penalized Cox regression, the mutation variables were recoded as binary indicators, with 1 indicating mutation and 0 indicating no mutation.
+
+The analysis was restricted to ER-positive patients who received hormone therapy, consistent with the main study cohort.
 
 
 We would also restrict the sample to ER+ and hormone_therapy ==1 only, same as our analysis cohort.
@@ -424,7 +1089,7 @@ range(fit$lambda)
 which.min(abs(fit$lambda - fit$lambda.min))
 length(fit$lambda)
 ```
-selected:
+selected variables:
 ```{r}
 lasso_coef <- coef(fit.lasso)
 
@@ -665,14 +1330,14 @@ best_index
 length(pen_grid)
 ```
 
-best fit:
+best fit model:
 ```{r}
 fit.coxbar <- coxbar_grid[[best_index]]$fit
 
 coef_bar <- coef(fit.coxbar)
 ```
 
-selected vars:
+selected variables:
 ```{r}
 coxbar_selected <- colnames(X)[coef_bar != 0]
 
@@ -694,9 +1359,10 @@ sum(sapply(coxbar_grid, function(x) x$refit_warn), na.rm = TRUE)
 
 sum(sapply(coxbar_grid, function(x) x$refit_ok), na.rm = TRUE)
 ```
-only 2 runs failed out of 50 penalties, all good;
-only 1 run had infinite coefficient warning, ignorable;
-48 runs of different penalties have good refit Cox models.
+
+Only 2 of the 50 penalty values failed during fitting.
+Only 1 run produced an infinite-coefficient warning in the refitted Cox model.
+Overall, 48 penalty values produced stable refitted Cox models.
 
 ### compare methods
 ```{r}
@@ -738,14 +1404,14 @@ refit_compare
 ```
 
 
-### select vars
-Our aim is to select 5~8 final gene variables to enter the cox model.
+### select variables
+Our aim was to select 5 to 8 final gene variables for inclusion in the Cox model.
 
 
-why choose coxBAR as main model (除了BIC最小最好之外):
-Because our goal was sparse and stable variable screening in a correlated genomic setting, we treated CoxBAR as the primary penalized Cox selection method. CoxBAR is a surrogate ℓ0 penalized Cox approach based on broken adaptive ridge and has been shown to possess selection consistency, oracle property for parameter estimation, and a grouping property for highly correlated covariates. In simulation and empirical evaluations, BAR based Cox regression selected relatively sparse models and achieved model selection and discriminatory performance comparable to or slightly better than Cox LASSO, with less biased and more stable solution paths under BIC based tuning.
+why choose CoxBAR as the main model:
+In addition that coxBAR gives best BIC, the main reason is because our goal was sparse and stable variable screening in a correlated genomic setting, we treated CoxBAR as the primary penalized Cox selection method. CoxBAR is a surrogate ℓ0 penalized Cox approach based on broken adaptive ridge and has been shown to have selection consistency, oracle property for parameter estimation, and a grouping property for highly correlated covariates. In simulation and empirical evaluations, BAR-based Cox regression selected relatively sparse models and achieved model selection and discriminatory performance comparable to or slightly better than Cox LASSO, with less biased and more stable solution paths under BIC-based tuning.
 
-Summarize selected variables overlapping:
+summarize overlap among selected variables:
 ```{r}
 all_selected <- list(
   lasso = lasso_selected,
@@ -770,20 +1436,503 @@ overlap_df
 ```
 
 
-在 4 个方法都出现 的变量是：
-tsc2, bbc3, sbno1, ptprd_mut, nek1_mut
-
-再从 coxBAR 中那些 出现了 3 次 的变量里补 1 到 2 个，例如：
-
-mapk14, kmt2c, casp8, hsd17b4
-
-这样最后凑成 6 到 7 个：
-tsc2, bbc3, sbno1, ptprd_mut, nek1_mut, mapk14, kmt2c (coxBAR里最重要的那两个)
-
-这组有两个优点。第一，完全以 coxBAR 为主。第二，稳定性很强，因为这 7 个里前 5 个在所有方法都出现，后 2 个也在 3 个方法里出现。
+The variables selected by all 4 methods were tsc2, bbc3, sbno1, ptprd_mut, and nek1_mut.
 
 
-最后选出来的变量：tsc2, bbc3, sbno1, ptprd_mut, nek1_mut, mapk14, kmt2c。注意ptprd_mut和 nek1_mut变量的原始格式是0或string，要把string全变成1，代表有突变，0代表无突变，再加入我们的cox model作为协变量。
+The final selected variables were tsc2, bbc3, sbno1, ptprd_mut, nek1_mut. This set was primarily based on CoxBAR and also showed good stability across selection methods, since the first five variables appeared in all four methods and the remaining two appeared in three methods.
+
+Because ptprd_mut and nek1_mut were originally recorded as either 0 or mutation-type strings, they were recoded as binary mutation indicators, with 1 indicating mutation and 0 indicating no mutation, before being entered into the Cox model.
+
+## Crude Cox with selected genes
+### set up data
+```{r}
+hx_dat0 <- METABRIC_RNA_Mutation %>%
+  as_tibble()
+
+hx_dat1 <- hx_dat0 %>%
+  transmute(
+    patient_id,
+    er_status,
+    hormone_therapy,
+    chemotherapy,
+    os_months = overall_survival_months,
+    os_event  = overall_survival,
+
+    age = age_at_diagnosis,
+    tumor_size,
+    nodes_positive = lymph_nodes_examined_positive,
+    grade = neoplasm_histologic_grade,
+    her2 = her2_status,
+    pam50 = `pam50_._claudin.low_subtype`,
+    tumor_stage,
+    menopausal_state = inferred_menopausal_state,
+    pr_status,
+    surgery = type_of_breast_surgery,
+    radio_therapy,
+
+    tsc2,
+    bbc3,
+    sbno1,
+    ptprd_mut,
+    nek1_mut,
+    mapk14,
+    kmt2c
+  )
+
+hx_dat2 <- hx_dat1 %>%
+  mutate(
+    across(where(is.character), ~ na_if(.x, "")),
+
+    er_status       = as.character(er_status),
+    hormone_therapy = as.character(hormone_therapy),
+    chemotherapy    = as.character(chemotherapy),
+
+    grade            = as.character(grade),
+    her2             = as.character(her2),
+    pam50            = as.character(pam50),
+    tumor_stage      = as.character(tumor_stage),
+    menopausal_state = as.character(menopausal_state),
+    pr_status        = as.character(pr_status),
+    surgery          = as.character(surgery),
+    radio_therapy    = as.character(radio_therapy),
+
+    os_months      = as.numeric(os_months),
+    os_event       = as.numeric(os_event),
+    age            = as.numeric(age),
+    tumor_size     = as.numeric(tumor_size),
+    nodes_positive = as.numeric(nodes_positive),
+
+    tsc2   = as.numeric(tsc2),
+    bbc3   = as.numeric(bbc3),
+    sbno1  = as.numeric(sbno1),
+    mapk14 = as.numeric(mapk14),
+    kmt2c  = as.numeric(kmt2c)
+  ) %>%
+  mutate(
+    hormone_therapy_num = case_when(
+      hormone_therapy %in% c("1", 1) ~ 1,
+      hormone_therapy %in% c("0", 0) ~ 0,
+      TRUE ~ NA_real_
+    ),
+    chemotherapy_num = case_when(
+      chemotherapy %in% c("1", 1) ~ 1,
+      chemotherapy %in% c("0", 0) ~ 0,
+      TRUE ~ NA_real_
+    ),
+    ptprd_mut_bin = case_when(
+      is.na(ptprd_mut) ~ NA_real_,
+      ptprd_mut %in% c("0", 0) ~ 0,
+      TRUE ~ 1
+    ),
+    nek1_mut_bin = case_when(
+      is.na(nek1_mut) ~ NA_real_,
+      nek1_mut %in% c("0", 0) ~ 0,
+      TRUE ~ 1
+    )
+  )
+
+hx_dat_er <- hx_dat2 %>%
+  filter(
+    er_status == "Positive",
+    hormone_therapy_num == 1
+  )
+```
+
+
+```{r}
+# set up data for crude cox and aft
+hx_dat_model <- hx_dat_er %>%
+  filter(
+    !is.na(os_months),
+    !is.na(os_event),
+    !is.na(chemotherapy_num),
+    !is.na(age),
+    !is.na(tumor_size),
+    !is.na(nodes_positive),
+    !is.na(grade),
+    !is.na(pam50),
+    !is.na(tsc2),
+    !is.na(bbc3),
+    !is.na(sbno1),
+    !is.na(ptprd_mut_bin),
+    !is.na(nek1_mut_bin)
+  ) %>%
+  mutate(
+    chemo = factor(
+      chemotherapy_num,
+      levels = c(0, 1),
+      labels = c("Hormone only", "Hormone + Chemo")
+    ),
+    chemo_num = chemotherapy_num,
+    grade = factor(grade),
+    pam50_grp = case_when(
+      pam50 %in% c("LumA", "LumB") ~ pam50,
+      TRUE ~ "Other"
+    )
+  ) %>%
+  mutate(
+    pam50_grp = factor(pam50_grp, levels = c("LumA", "LumB", "Other")),
+    ptprd_mut_bin = factor(ptprd_mut_bin, levels = c(0, 1), labels = c("No", "Yes")),
+    nek1_mut_bin  = factor(nek1_mut_bin,  levels = c(0, 1), labels = c("No", "Yes"))
+  ) %>%
+  filter(!is.na(pam50_grp))
+
+nrow(hx_dat_model)
+table(hx_dat_model$chemo, useNA = "ifany")
+table(hx_dat_model$grade, useNA = "ifany")
+table(hx_dat_model$pam50_grp, useNA = "ifany")
+```
+
+
+### Cox model without time-dependent chemotherapy
+```{r}
+# fit crude cox model
+hx_cox_formula <- Surv(os_months, os_event) ~
+  chemo +
+  age +
+  tumor_size +
+  nodes_positive +
+  grade +
+  pam50_grp +
+  tsc2 +
+  bbc3 +
+  sbno1 +
+  ptprd_mut_bin +
+  nek1_mut_bin
+
+hx_cox_fit <- coxph(
+  hx_cox_formula,
+  data = hx_dat_model,
+  ties = "breslow"
+)
+
+summary(hx_cox_fit)
+```
+
+```{r}
+# vif check
+hx_lm_proxy <- lm(
+  os_months ~ chemo + age + tumor_size + nodes_positive + grade +
+    pam50_grp + tsc2 + bbc3 + sbno1 + ptprd_mut_bin + nek1_mut_bin,
+  data = hx_dat_model
+)
+
+vif(hx_lm_proxy)
+```
+
+```{r}
+# ph assumption check
+hx_ph_res <- cox.zph(hx_cox_fit)
+hx_ph_res
+plot(hx_ph_res)
+```
+
+
+
+### Cox model with time-dependent chemotherapy
+```{r}
+# time-dependent cox
+hx_event_times <- sort(unique(hx_dat_model$os_months[hx_dat_model$os_event == 1]))
+hx_event_times <- hx_event_times[-1]
+
+hx_dat_split <- survSplit(
+  data  = hx_dat_model,
+  cut   = hx_event_times,
+  end   = "os_months",
+  start = "t0",
+  event = "os_event"
+) %>%
+  mutate(
+    chemo_num = ifelse(chemo == "Hormone + Chemo", 1, 0),
+    chemo_t   = chemo_num * log(os_months)
+  )
+```
+
+```{r}
+hx_cox_td_fit <- coxph(
+  Surv(t0, os_months, os_event) ~
+    chemo_num +
+    chemo_t +
+    age +
+    tumor_size +
+    nodes_positive +
+    grade +
+    pam50_grp +
+    tsc2 +
+    bbc3 +
+    sbno1 +
+    ptprd_mut_bin +
+    nek1_mut_bin,
+  data = hx_dat_split,
+  ties = "breslow"
+)
+
+summary(hx_cox_td_fit)
+```
+
+```{r}
+# ph check for td cox
+hx_ph_td_res <- cox.zph(hx_cox_td_fit)
+hx_ph_td_res
+plot(hx_ph_td_res)
+```
+
+### Anderson's plot
+```{r}
+# draw anderson plot
+hx_reptime <- function(l, t, range_of_time) {
+  x <- numeric(length(range_of_time))
+  for (i in seq_along(range_of_time)) {
+    dif <- range_of_time[i] - t
+    dif <- dif[dif >= 0]
+    if (length(dif) > 0) {
+      x[i] <- l[which.min(dif)]
+    } else {
+      x[i] <- 0
+    }
+  }
+  x
+}
+
+hx_dat_anderson <- hx_dat_model %>%
+  mutate(chemo_num = ifelse(chemo == "Hormone + Chemo", 1, 0))
+
+hx_fit_and <- basehaz(
+  coxph(
+    Surv(os_months, os_event) ~ strata(chemo_num),
+    data = hx_dat_anderson,
+    ties = "breslow"
+  ),
+  centered = FALSE
+)
+
+hx_H0 <- hx_fit_and$hazard[hx_fit_and$strata == "chemo_num=0"]
+hx_H1 <- hx_fit_and$hazard[hx_fit_and$strata == "chemo_num=1"]
+
+hx_t0 <- hx_fit_and$time[hx_fit_and$strata == "chemo_num=0"]
+hx_t1 <- hx_fit_and$time[hx_fit_and$strata == "chemo_num=1"]
+
+hx_grid_time <- sort(unique(c(hx_t0, hx_t1)))
+
+hx_H0_rep <- hx_reptime(hx_H0, hx_t0, hx_grid_time)
+hx_H1_rep <- hx_reptime(hx_H1, hx_t1, hx_grid_time)
+
+plot(
+  hx_H1_rep ~ hx_H0_rep,
+  main = "Anderson Plot for Chemotherapy Groups",
+  xlab = "Cumulative Hazard: Hormone only",
+  ylab = "Cumulative Hazard: Hormone + Chemo",
+  type = "s"
+)
+abline(0, 1, lty = 2, col = "red")
+```
+
+### Cox-snell residual plot
+```{r}
+# draw cox-snell residual plot
+hx_cs_resid <- predict(hx_cox_td_fit, type = "expected")
+
+hx_fit_cs <- survfit(Surv(hx_cs_resid, os_event) ~ 1, data = hx_dat_split)
+
+hx_H_cs <- cumsum(hx_fit_cs$n.event / hx_fit_cs$n.risk)
+
+plot(
+  hx_fit_cs$time, hx_H_cs,
+  type = "s",
+  col = "blue",
+  main = "Cox-Snell Residual Plot\nFinal Time-Dependent Cox Model",
+  xlab = "Cox-Snell Residual",
+  ylab = "Nelson-Aalen Cumulative Hazard"
+)
+abline(0, 1, col = "red", lty = 2)
+```
+
+## AFT models
+```{r}
+# fit aft models
+hx_aft_formula <- Surv(os_months, os_event) ~
+  chemo +
+  age +
+  tumor_size +
+  nodes_positive +
+  grade +
+  pam50_grp +
+  tsc2 +
+  bbc3 +
+  sbno1 +
+  ptprd_mut_bin +
+  nek1_mut_bin
+
+hx_fit_exp <- survreg(hx_aft_formula, data = hx_dat_model, dist = "exponential")
+hx_fit_weib <- survreg(hx_aft_formula, data = hx_dat_model, dist = "weibull")
+hx_fit_lnorm <- survreg(hx_aft_formula, data = hx_dat_model, dist = "lognormal")
+hx_fit_llogis <- survreg(hx_aft_formula, data = hx_dat_model, dist = "loglogistic")
+```
+
+```{r}
+# compare aft models
+hx_model_compare <- data.frame(
+  Model = c("Exponential", "Weibull", "Log-normal", "Log-logistic"),
+  AIC = c(AIC(hx_fit_exp), AIC(hx_fit_weib), AIC(hx_fit_lnorm), AIC(hx_fit_llogis)),
+  BIC = c(BIC(hx_fit_exp), BIC(hx_fit_weib), BIC(hx_fit_lnorm), BIC(hx_fit_llogis)),
+  logLik = c(logLik(hx_fit_exp), logLik(hx_fit_weib), logLik(hx_fit_lnorm), logLik(hx_fit_llogis))
+) %>%
+  arrange(AIC)
+
+hx_model_compare
+```
+
+```{r}
+# summarize aft models
+summary(hx_fit_exp)
+summary(hx_fit_weib)
+summary(hx_fit_lnorm)
+summary(hx_fit_llogis)
+```
+
+```{r}
+summary(hx_fit_weib)
+```
+
+
+```{r}
+# extract aft time ratios
+hx_extract_aft_table <- function(fit) {
+  tb <- as.data.frame(summary(fit)$table)
+  tb$term <- rownames(tb)
+
+  tb %>%
+    mutate(
+      lower = Value - 1.96 * `Std. Error`,
+      upper = Value + 1.96 * `Std. Error`,
+      TR = exp(Value),
+      TR_lower = exp(lower),
+      TR_upper = exp(upper)
+    ) %>%
+    select(term, Value, `Std. Error`, p, TR, TR_lower, TR_upper)
+}
+
+hx_aft_exp_table <- hx_extract_aft_table(hx_fit_exp)
+hx_aft_weib_table <- hx_extract_aft_table(hx_fit_weib)
+hx_aft_lnorm_table <- hx_extract_aft_table(hx_fit_lnorm)
+hx_aft_llogis_table <- hx_extract_aft_table(hx_fit_llogis)
+
+hx_aft_weib_table
+```
+
+
+```{r}
+# plot adjusted survival from weibull aft
+
+library(flexsurv)
+
+hx_fit_weib_flex <- flexsurvreg(
+  hx_aft_formula,
+  data = hx_dat_model,
+  dist = "weibull"
+)
+
+hx_newdata_typical <- data.frame(
+  chemo = factor(c("Hormone only", "Hormone + Chemo"),
+                 levels = levels(hx_dat_model$chemo)),
+  age = mean(hx_dat_model$age, na.rm = TRUE),
+  tumor_size = mean(hx_dat_model$tumor_size, na.rm = TRUE),
+  nodes_positive = mean(hx_dat_model$nodes_positive, na.rm = TRUE),
+  grade = factor(levels(hx_dat_model$grade)[1], levels = levels(hx_dat_model$grade)),
+  pam50_grp = factor("LumA", levels = levels(hx_dat_model$pam50_grp)),
+  tsc2 = mean(hx_dat_model$tsc2, na.rm = TRUE),
+  bbc3 = mean(hx_dat_model$bbc3, na.rm = TRUE),
+  sbno1 = mean(hx_dat_model$sbno1, na.rm = TRUE),
+  ptprd_mut_bin = factor("No", levels = levels(hx_dat_model$ptprd_mut_bin)),
+  nek1_mut_bin = factor("No", levels = levels(hx_dat_model$nek1_mut_bin))
+)
+
+hx_pred <- summary(
+  hx_fit_weib_flex,
+  newdata = hx_newdata_typical,
+  type = "survival",
+  t = seq(0, 250, by = 1)
+)
+
+plot(
+  hx_pred[[1]]$time, hx_pred[[1]]$est,
+  type = "l", lwd = 2,
+  xlab = "Time since diagnosis (months)",
+  ylab = "Adjusted survival probability",
+  main = "Adjusted Survival Curves from Weibull AFT"
+)
+
+lines(hx_pred[[2]]$time, hx_pred[[2]]$est, lwd = 2, lty = 2)
+
+legend(
+  "topright",
+  legend = c("Hormone only", "Hormone + Chemo"),
+  lwd = 2,
+  lty = c(1, 2)
+)
+```
+
+
+## Model Comparisons
+### c-index
+```{r}
+# clinical-only time-dependent cox
+ccox_td_score <- -predict(ccox_td_fit, type = "lp")
+ccox_td_c <- concordance(
+  Surv(t0, os_months, os_event) ~ ccox_td_score,
+  data = dat_ccox_split
+)
+
+# weighted time-dependent cox
+cox_w_td_score <- -predict(cox_w_td, type = "lp")
+cox_w_td_c <- concordance(
+  Surv(t0, os_months, os_event) ~ cox_w_td_score,
+  data = dat_split_w
+)
+
+# crude cox + gene time-dependent
+hx_cox_td_score <- -predict(hx_cox_td_fit, type = "lp")
+hx_cox_td_c <- concordance(
+  Surv(t0, os_months, os_event) ~ hx_cox_td_score,
+  data = hx_dat_split
+)
+
+# aft (weibull)
+weib_score <- predict(hx_fit_weib, type = "lp")
+weib_c <- concordance(
+  Surv(os_months, os_event) ~ weib_score,
+  data = hx_dat_model
+)
+
+# combine results
+cindex_compare <- data.frame(
+  model = c(
+    "Clinical-only TD Cox",
+    "Weighted TD Cox",
+    "TD Cox + Gene",
+    "AFT Weibull"
+  ),
+  c_index = c(
+    ccox_td_c$concordance,
+    cox_w_td_c$concordance,
+    hx_cox_td_c$concordance,
+    weib_c$concordance
+  ),
+  se = c(
+    sqrt(ccox_td_c$var),
+    sqrt(cox_w_td_c$var),
+    sqrt(hx_cox_td_c$var),
+    sqrt(weib_c$var)
+  )
+)
+
+cindex_compare
+```
+
+The concordance indices indicate moderate discriminative performance across the survival models. The clinical-only time-dependent Cox model achieved a C-index of 0.613, while the IPTW weighted time-dependent Cox model produced a very similar value of 0.607, suggesting that weighting to address confounding by indication had little impact on the model’s overall predictive discrimination. In contrast, incorporating the selected gene variables substantially improved model performance. The time-dependent Cox model with gene predictors achieved a higher C-index of 0.676, indicating better ability to distinguish patients with different survival outcomes. The Weibull AFT model showed comparable discrimination with a C-index of 0.671, suggesting that the parametric AFT framework provides similar predictive capability to the Cox model when using the same set of predictors. Overall, these results suggest that while propensity score weighting primarily adjusts treatment effect estimation, the inclusion of selected gene variables meaningfully improves the model’s ability to predict survival.
+
+
+
 
 
 
